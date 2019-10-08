@@ -52,7 +52,7 @@ impl VirtualMachine {
 
         vmcs.with_active_vmcs(vmx, |mut vmcs| {
             Self::setup_ept(&mut vmcs, alloc)?;
-            Self::initialize_host_vmcs(&mut vmcs, &stack)?;
+            Self::initialize_host_vmcs(alloc, &mut vmcs, &stack)?;
             Self::initialize_guest_vmcs(&mut vmcs)?;
             Self::initialize_ctrl_vmcs(&mut vmcs, alloc)?;
             Ok(())
@@ -90,14 +90,19 @@ impl VirtualMachine {
             false,
         )?;
 
-        let eptp = ept_pml4_frame.start_address().as_u64() | (4 - 1) << 3;
+        let mut eptp = ept_pml4_frame.start_address().as_u64() ;
+        eptp |= 6;// query the bit 8 of the VPID_EPT VMX CAP
+        eptp |= (4 - 1) << 3; // page-walk length:4
+        eptp |= 1 << 6; // enable acccessed and dirty marking
 
         vmcs.write_field(vmcs::VmcsField::EptPointer, eptp)?;
+        vmcs.write_field(vmcs::VmcsField::VirtualProcessorId, 1)?;
 
         Ok(ept_pml4_frame)
     }
 
     fn initialize_host_vmcs(
+        alloc: &mut impl FrameAllocator<Size4KiB>,
         vmcs: &mut vmcs::TemporaryActiveVmcs,
         stack: &PhysFrame<Size4KiB>,
     ) -> Result<()> {
@@ -112,12 +117,12 @@ impl VirtualMachine {
         vmcs.write_field(vmcs::VmcsField::HostCr4, Cr4::read())?;
 
         vmcs.write_field(vmcs::VmcsField::HostEsSelector, 0x00)?;
-        vmcs.write_field(vmcs::VmcsField::HostCsSelector, 0x00)?;
+        vmcs.write_field(vmcs::VmcsField::HostCsSelector, 0xe008)?;
         vmcs.write_field(vmcs::VmcsField::HostSsSelector, 0x00)?;
         vmcs.write_field(vmcs::VmcsField::HostDsSelector, 0x00)?;
         vmcs.write_field(vmcs::VmcsField::HostFsSelector, 0x00)?;
         vmcs.write_field(vmcs::VmcsField::HostGsSelector, 0x00)?;
-        vmcs.write_field(vmcs::VmcsField::HostTrSelector, 0x00)?;
+        vmcs.write_field(vmcs::VmcsField::HostTrSelector, 0x10)?;
 
         vmcs.write_field(vmcs::VmcsField::HostIa32SysenterCs, 0x00)?;
         vmcs.write_field(vmcs::VmcsField::HostIa32SysenterEsp, 0x00)?;
@@ -125,9 +130,17 @@ impl VirtualMachine {
 
         vmcs.write_field(vmcs::VmcsField::HostIdtrBase, IdtrBase::read().as_u64())?;
         vmcs.write_field(vmcs::VmcsField::HostGdtrBase, GdtrBase::read().as_u64())?;
-
         vmcs.write_field(vmcs::VmcsField::HostFsBase, FsBase::read().as_u64())?;
         vmcs.write_field(vmcs::VmcsField::HostGsBase, GsBase::read().as_u64())?;
+
+        let mut tr_base_frame = alloc
+            .allocate_frame()
+            .expect("Failed to allocate host tr base frame");
+
+        vmcs.write_field(
+            vmcs::VmcsField::HostTrBase,
+            tr_base_frame.start_address().as_u64(),
+        );
 
         vmcs.write_field(vmcs::VmcsField::HostRsp, stack.start_address().as_u64())?;
         vmcs.write_field(vmcs::VmcsField::HostIa32Efer, Efer::read().bits())?;
@@ -224,14 +237,35 @@ impl VirtualMachine {
 
         vmcs.write_with_fixed(
             vmcs::VmcsField::VmExitControls,
-            0,
+            vmcs::VmExitCtrlFlags::IA32E_MODE.bits(),
             registers::MSR_IA32_VMX_EXIT_CTLS,
         )?;
+
+        let field = vmcs.read_field(vmcs::VmcsField::VmExitControls)?;
+        info!("Exit Flags: 0x{:x}", field);
+        let flags = vmcs::VmExitCtrlFlags::from_bits_truncate(field);
+        info!("Exit Flags: {:?}", flags);
 
         vmcs.write_with_fixed(
             vmcs::VmcsField::VmEntryControls,
             0,
             registers::MSR_IA32_VMX_ENTRY_CTLS,
+        )?;
+
+        // vmcs.write_with_fixed(
+        //     vmcs::VmcsField::SecondaryVmExecControl,
+        //     (vmcs::SecondaryExecFlags::ENABLE_EPT)
+        //         .bits(),
+        //     registers::MSR_IA32_VMX_PROCBASED_CTLS2,
+        // )?;
+
+        let vapic = alloc
+            .allocate_frame()
+            .ok_or(Error::AllocError("Failed to allocate VAPIC"))?;
+
+        vmcs.write_field(
+            vmcs::VmcsField::VirtualApicPageAddr,
+            vapic.start_address().as_u64(),
         )?;
 
         vmcs.write_field(vmcs::VmcsField::ExceptionBitmap, 0xffffffff)?;
@@ -240,6 +274,11 @@ impl VirtualMachine {
         info!("Flags: 0x{:x}", field);
         let flags = vmcs::CpuBasedCtrlFlags::from_bits_truncate(field);
         info!("Flags: {:?}", flags);
+
+        let field = vmcs.read_field(vmcs::VmcsField::SecondaryVmExecControl)?;
+        info!("Secondary Flags: 0x{:x}", field);
+        let flags = vmcs::SecondaryExecFlags::from_bits_truncate(field);
+        info!("Secondary Flags: {:?}", flags);
 
         //FIXME: this leaks the bitmap frames
         let bitmap_a = alloc
